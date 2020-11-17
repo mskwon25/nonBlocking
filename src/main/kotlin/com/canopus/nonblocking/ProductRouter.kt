@@ -1,16 +1,25 @@
 package com.canopus.nonblocking
 
+import com.fasterxml.jackson.databind.ObjectMapper
+import kotlinx.coroutines.reactive.awaitFirst
+import kotlinx.coroutines.reactive.awaitFirstOrNull
+import org.apache.kafka.clients.producer.ProducerRecord
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.data.r2dbc.core.DatabaseClient
+import org.springframework.http.MediaType
 import org.springframework.stereotype.Component
 import org.springframework.stereotype.Repository
+import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.reactive.function.client.awaitBody
 import org.springframework.web.reactive.function.server.*
+import reactor.core.publisher.Mono
 import reactor.kafka.sender.KafkaSender
+import java.lang.RuntimeException
 
 /**
- * Non Blocking 지원하는 R2DBC, Reactive Kafka, WebClient 이용해서
- * 샹품 조회 API 만들기
+ * Non Blocking 지원하는 R2DBC, Reactive Kafka, WebClient 와
+ * EndPoint 방식의 RouterFunction 이용해서 샹품 조회 API 만들기
  *
  * 1. 상품 번호를 받아서 DB 로부터 상품 정보을 조회한다
  * 2. 상품 정보의 재고 번호, 전시 번호를 바탕으로 다시 재고, 전시 서버로 부터 각각의 정보를 요청한다
@@ -22,11 +31,49 @@ import reactor.kafka.sender.KafkaSender
 @Configuration
 class ProductRouter(
     private val productRepository: ProductRepository,
-    private val kafkaProducer: KafkaProducer
+    private val kafkaProducer: KafkaProducer,
+    private val webClient: WebClient
 ) {
     @Bean
     fun coRouteProduct(): RouterFunction<ServerResponse> {
-        TODO("not implemented")
+        return coRouter {
+            GET("/products/{id}") { request ->
+                val id = request.pathVariable("id").toInt()
+
+                val product = productRepository.getProduct(id) ?: throw ProductNotFoundException()
+                val stockInfo = getStockInfo(product.stockNo)
+                val displayInfo = getDisplayInfo(product.displayNo)
+                kafkaProducer.send("productInquired", product.id)
+
+                ok().bodyValueAndAwait(ProductResponse(product.name, stockInfo.stock, displayInfo.displayName))
+            }
+        }
+    }
+
+    /**
+     * 재고 정보를 조회하기 위해 재고 API 호출
+     *
+     * @param stockNo 재고 번호
+     */
+    suspend fun getStockInfo(stockNo: Int): StockInfo {
+        return webClient.get()
+            .uri("localhost:8081/stocks/$stockNo")
+            .accept(MediaType.APPLICATION_JSON)
+            .retrieve()
+            .awaitBody()
+    }
+
+    /**
+     * 전시 정보를 조회하기 위해 재고 API 호출
+     *
+     * @param displayNo 전시 번호
+     */
+    suspend fun getDisplayInfo(displayNo: Int): DisplayInfo {
+        return webClient.get()
+            .uri("localhost:8081/display/$displayNo")
+            .accept(MediaType.APPLICATION_JSON)
+            .retrieve()
+            .awaitBody()
     }
 }
 
@@ -36,15 +83,20 @@ class ProductRouter(
  * @property [DatabaseClient]
  */
 @Repository
-class ProductRepository {
+class ProductRepository(private val client: DatabaseClient) {
 
     /**
      * 상품 번호로 상품 정보를 조회한다
      *
      * @param id
      */
-    fun getProduct() {
-        TODO("not implemented")
+    suspend fun getProduct(id: Int): Product? {
+        return client
+            .execute("SELECT * FROM product WHERE id = $id")
+            .`as`(Product::class.java)
+            .fetch()
+            .one()
+            .awaitFirstOrNull()
     }
 }
 
@@ -54,7 +106,7 @@ class ProductRepository {
  * @property [KafkaSender]
  */
 @Component
-class KafkaProducer {
+class KafkaProducer(private val kafkaSender: KafkaSender<String, String>) {
 
     /**
      * kafka message 발행
@@ -62,11 +114,14 @@ class KafkaProducer {
      * @param topic
      * @param message
      */
-    fun send() {
-        TODO("not implemented")
+    suspend fun send(topic: String, message: Any) {
+        kafkaSender.createOutbound()
+            .send(Mono.just(ProducerRecord(topic, message.toString())))
+            .then()
+            .awaitFirstOrNull()
     }
 
-    //    fun Any.toJson(): String = ObjectMapper().writeValueAsString(this)
+    fun Any.toJson(): String = ObjectMapper().writeValueAsString(this)
 }
 
 /**
@@ -75,13 +130,35 @@ class KafkaProducer {
  * @property id 상품 ID
  * @property name 상품명
  * @property stockNo 재고 번호
- * @property displayCategoryNo 전시 번호
+ * @property displayNo 전시 번호
  */
 class Product(
     val id: Int,
     val name: String,
     val stockNo: Int,
-    val displayCategoryNo: Int
+    val displayNo: Int
+)
+
+/**
+ * 재고 정보
+ *
+ * @property stockNo 재고 번호
+ * @property stock 재고량
+ */
+class StockInfo(
+    val stockNo: Int,
+    val stock: Int
+)
+
+/**
+ * 전시 정보
+ *
+ * @property displayNo 전시 번호
+ * @property displayName 전시명
+ */
+class DisplayInfo(
+    val displayNo: Int,
+    val displayName: String
 )
 
 /**
@@ -89,10 +166,12 @@ class Product(
  *
  * @property productName 상품명
  * @property stock 재고
- * @property displayCategoryName 전시명
+ * @property displayName 전시명
  */
 class ProductResponse(
     val productName: String,
     val stock: Int,
-    val displayCategoryNo: Int
+    val displayName: String
 )
+
+class ProductNotFoundException : RuntimeException()
