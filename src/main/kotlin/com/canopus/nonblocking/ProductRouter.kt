@@ -124,8 +124,6 @@ class KafkaProducer(private val kafkaSender: KafkaSender<String, String>) {
     }
 
     fun Any.toJson(): String = ObjectMapper().writeValueAsString(this)
-    fun KafkaOutbound<String, String>.send(record: ProducerRecord<String, String>): KafkaOutbound<String, String> =
-        this.send(Mono.just(record))
 }
 
 /**
