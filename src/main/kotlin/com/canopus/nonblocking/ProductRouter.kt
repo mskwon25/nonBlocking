@@ -1,6 +1,8 @@
 package com.canopus.nonblocking
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.reactive.awaitFirst
 import kotlinx.coroutines.reactive.awaitFirstOrNull
 import org.apache.kafka.clients.producer.ProducerRecord
@@ -14,16 +16,19 @@ import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.reactive.function.client.awaitBody
 import org.springframework.web.reactive.function.server.*
 import reactor.core.publisher.Mono
+import reactor.kafka.sender.KafkaOutbound
 import reactor.kafka.sender.KafkaSender
+import reactor.util.function.Tuples
 import java.lang.RuntimeException
 
 /**
- * Non Blocking 지원하는 R2DBC, Reactive Kafka, WebClient 와
- * EndPoint 방식의 RouterFunction 이용해서 샹품 조회 API 만들기
+ * Non Blocking 지원하는 R2DBC, Reactive Kafka, WebClient 사용해
+ * 샹품 조회 API 만들기
  *
- * 1. 상품 번호를 받아서 DB 로부터 상품 정보을 조회한다
- * 2. 상품 정보의 재고 번호, 전시 번호를 바탕으로 다시 재고, 전시 서버로 부터 각각의 정보를 요청한다
- * 3. 상품 조회수 증가를 위한 MessageQueue 메시지를 발행한다.
+ * 기능 설명
+ * 1. 상품 번호를 파라미터로 받아서 DB 로부터 상품 정보을 조회한다
+ * 2. 상품 정보중 재고 번호, 전시 번호를 바탕으로 다시 재고, 전시 서버로 부터 각각의 상세 정보를 요청한다
+ * 3. 상품 조회수 증가를 위한 메세지큐에 메시지를 발행한다.
  * 4. 응답 객체를 내려준다
  *
  * @author Minseok Kwon
@@ -39,7 +44,6 @@ class ProductRouter(
         return coRouter {
             GET("/products/{id}") { request ->
                 val id = request.pathVariable("id").toInt()
-
                 val product = productRepository.getProduct(id) ?: throw ProductNotFoundException()
                 val stockInfo = getStockInfo(product.stockNo)
                 val displayInfo = getDisplayInfo(product.displayNo)
@@ -58,7 +62,6 @@ class ProductRouter(
     suspend fun getStockInfo(stockNo: Int): StockInfo {
         return webClient.get()
             .uri("localhost:8081/stocks/$stockNo")
-            .accept(MediaType.APPLICATION_JSON)
             .retrieve()
             .awaitBody()
     }
@@ -71,7 +74,6 @@ class ProductRouter(
     suspend fun getDisplayInfo(displayNo: Int): DisplayInfo {
         return webClient.get()
             .uri("localhost:8081/display/$displayNo")
-            .accept(MediaType.APPLICATION_JSON)
             .retrieve()
             .awaitBody()
     }
@@ -116,12 +118,14 @@ class KafkaProducer(private val kafkaSender: KafkaSender<String, String>) {
      */
     suspend fun send(topic: String, message: Any) {
         kafkaSender.createOutbound()
-            .send(Mono.just(ProducerRecord(topic, message.toString())))
+            .send(ProducerRecord(topic, message.toJson()))
             .then()
             .awaitFirstOrNull()
     }
 
     fun Any.toJson(): String = ObjectMapper().writeValueAsString(this)
+    fun KafkaOutbound<String, String>.send(record: ProducerRecord<String, String>): KafkaOutbound<String, String> =
+        this.send(Mono.just(record))
 }
 
 /**
